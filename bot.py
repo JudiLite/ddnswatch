@@ -272,6 +272,41 @@ def target_text(r):
     mode="持续检测 DNS" if r["dns_mode"]=="continuous" else "故障后解析"
     return f"{icons.get(st,'⚪')} {r['name']}\n目标：{r['target']}:{r['port']}\n当前 IP：{r['current_ip'] or '未检测'}\n状态：{st}{since}\n间隔：{r['interval_seconds']}秒\n模式：{mode}\n启用：{'是' if r['enabled'] else '否'}\n最后错误：{r['last_error'] or '无'}"
 
+def detail_keyboard(r):
+    tid=r["id"]; toggle="暂停" if r["enabled"] else "启用"
+    return [[{"text":"🔄 立即检测","callback_data":f"check:{tid}"},{"text":toggle,"callback_data":f"toggle:{tid}"}],
+            [{"text":"✏️ 修改间隔","callback_data":f"editint:{tid}"},{"text":"🗑 删除","callback_data":f"delask:{tid}"}],
+            [{"text":"⬅️ 列表","callback_data":"list"}]]
+
+def check_one_ui(tid, chat, mid):
+    try:
+        check_target(tid, True)
+        r=get_target(tid)
+        if not r:
+            panel(chat,"检测目标已不存在。",main_keyboard(),mid); return
+        icon="✅" if r["status"]=="UP" else "❌"
+        panel(chat,f"{icon} 检测完成\n\n"+target_text(r),detail_keyboard(r),mid)
+    except Exception as e:
+        log.exception("手动检测目标 %s 失败",tid)
+        panel(chat,f"❌ 检测执行失败\n\n错误：{e}",[[{"text":"返回详情","callback_data":f"view:{tid}"}]],mid)
+
+def summary_text(prefix="📊 状态总览"):
+    with DB_LOCK, db() as c:
+        rows=c.execute("SELECT COALESCE(s.status,'INIT') status,COUNT(*) n FROM targets t LEFT JOIN states s ON s.target_id=t.id GROUP BY status").fetchall()
+    z={r["status"]:r["n"] for r in rows}
+    return f"{prefix}\n\n🟢 正常：{z.get('UP',0)}\n🔴 故障：{z.get('DOWN',0)}\n⚪ 待检测：{z.get('INIT',0)}"
+
+def check_all_ui(ids, chat, mid):
+    total=len(ids)
+    try:
+        for index,tid in enumerate(ids,1):
+            check_target(tid,True)
+            panel(chat,f"🔄 正在检测全部目标…\n\n进度：{index}/{total}",[[{"text":"请稍候…","callback_data":"noop"}]],mid)
+        panel(chat,summary_text("✅ 全部检测完成"),[[{"text":"📋 查看列表","callback_data":"list"},{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
+    except Exception as e:
+        log.exception("全部检测失败")
+        panel(chat,f"❌ 全部检测未完成\n\n错误：{e}",[[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
+
 def show_list(chat, mid=None):
     with DB_LOCK, db() as c: rows=c.execute("SELECT t.*,COALESCE(s.status,'INIT') status FROM targets t LEFT JOIN states s ON s.target_id=t.id ORDER BY t.id").fetchall()
     if not rows: return panel(chat,"📋 暂无监测目标。",[[{"text":"➕ 添加","callback_data":"add"}],[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
@@ -284,9 +319,8 @@ def add_prompt(chat, step, text=None, mid=None):
     panel(chat,text or prompts[step],[[{"text":"❌ 取消","callback_data":"cancel"}]],mid)
 
 def handle_message(m):
-    chat=m["chat"]["id"]; uid=m.get("from",{}).get("id",0); text=m.get("text","").strip(); user_mid=m.get("message_id")
+    chat=m["chat"]["id"]; uid=m.get("from",{}).get("id",0); text=m.get("text","").strip()
     if uid not in ADMINS: send(chat,f"⛔ 你没有权限使用此 Bot。\n你的 Telegram ID：{uid}"); return
-    delete_message(chat,user_mid)
     if text in ("/start","/menu","/cancel"): SESSIONS.pop(uid,None); menu(chat); return
     s=SESSIONS.get(uid)
     if not s: menu(chat,"无法识别命令，请使用菜单："); return
@@ -325,7 +359,8 @@ def confirm_add(chat,uid):
     SESSIONS[uid]["step"]="confirm"
 
 def callback(q):
-    uid=q["from"]["id"]; chat=q["message"]["chat"]["id"]; mid=q["message"]["message_id"]; data=q.get("data",""); PANELS[chat]=mid; answer(q["id"])
+    uid=q["from"]["id"]; chat=q["message"]["chat"]["id"]; mid=q["message"]["message_id"]; data=q.get("data",""); PANELS[chat]=mid
+    if not (data.startswith("check:") or data in ("checkall","noop")): answer(q["id"])
     if uid not in ADMINS: send(chat,f"⛔ 无权限。你的 Telegram ID：{uid}"); return
     # 离开添加/编辑流程时清除旧会话，避免删除后仍提示输入间隔。
     if not (data in ("add", "addconfirm") or data.startswith("mode:") or data.startswith("editint:")):
@@ -348,15 +383,18 @@ def callback(q):
     elif data.startswith("view:"):
         tid=int(data.split(":")[1]); r=get_target(tid)
         if not r: panel(chat,"目标不存在。",main_keyboard(),mid); return
-        toggle="暂停" if r["enabled"] else "启用"
-        panel(chat,target_text(r),[[{"text":"🔄 立即检测","callback_data":f"check:{tid}"},{"text":toggle,"callback_data":f"toggle:{tid}"}],[{"text":"✏️ 修改间隔","callback_data":f"editint:{tid}"},{"text":"🗑 删除","callback_data":f"delask:{tid}"}],[{"text":"⬅️ 列表","callback_data":"list"}]],mid)
+        panel(chat,target_text(r),detail_keyboard(r),mid)
     elif data.startswith("check:"):
-        tid=int(data.split(":")[1]); POOL.submit(check_target,tid,True); answer(q["id"],"已开始检测")
+        tid=int(data.split(":")[1]); r=get_target(tid)
+        if not r: panel(chat,"目标不存在。",main_keyboard(),mid); return
+        answer(q["id"],"正在检测，请稍候…")
+        panel(chat,f"🔄 正在检测\n\n名称：{r['name']}\n目标：{r['target']}:{r['port']}\n\n通常会在数秒内完成。",[[{"text":"请稍候…","callback_data":"noop"}]],mid)
+        POOL.submit(check_one_ui,tid,chat,mid)
     elif data.startswith("toggle:"):
         tid=int(data.split(":")[1])
         with DB_LOCK, db() as c: c.execute("UPDATE targets SET enabled=1-enabled,updated_at=? WHERE id=?",(int(time.time()),tid)); c.execute("UPDATE states SET next_check_at=0 WHERE target_id=?",(tid,))
-        r=get_target(tid); toggle="暂停" if r["enabled"] else "启用"
-        panel(chat,target_text(r),[[{"text":"🔄 立即检测","callback_data":f"check:{tid}"},{"text":toggle,"callback_data":f"toggle:{tid}"}],[{"text":"✏️ 修改间隔","callback_data":f"editint:{tid}"},{"text":"🗑 删除","callback_data":f"delask:{tid}"}],[{"text":"⬅️ 列表","callback_data":"list"}]],mid)
+        r=get_target(tid)
+        panel(chat,target_text(r),detail_keyboard(r),mid)
     elif data.startswith("editint:"):
         tid=int(data.split(":")[1]); SESSIONS[uid]={"step":"edit_interval","data":{"id":tid}}; panel(chat,"请输入新的检测间隔秒数（10-86400）：",[[{"text":"❌ 取消","callback_data":f"view:{tid}"}]],mid)
     elif data.startswith("delask:"):
@@ -367,27 +405,32 @@ def callback(q):
         with DB_LOCK, db() as c: c.execute("DELETE FROM targets WHERE id=?",(tid,))
         panel(chat,"✅ 已删除监测目标。",main_keyboard(),mid)
     elif data=="summary":
-        with DB_LOCK, db() as c: rows=c.execute("SELECT COALESCE(s.status,'INIT') status,COUNT(*) n FROM targets t LEFT JOIN states s ON s.target_id=t.id GROUP BY status").fetchall()
-        z={r["status"]:r["n"] for r in rows}; panel(chat,f"📊 状态总览\n\n🟢 正常：{z.get('UP',0)}\n🔴 故障：{z.get('DOWN',0)}\n⚪ 待检测：{z.get('INIT',0)}",[[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
+        panel(chat,summary_text(),[[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
     elif data=="checkall":
         with DB_LOCK, db() as c: ids=[r[0] for r in c.execute("SELECT id FROM targets WHERE enabled=1")]
-        for tid in ids: POOL.submit(check_target,tid,True)
-        answer(q["id"],f"已触发 {len(ids)} 个目标检测")
+        if not ids:
+            answer(q["id"],"没有已启用的监测目标")
+            panel(chat,"⚠️ 没有已启用的监测目标。",[[{"text":"➕ 添加监测","callback_data":"add"},{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
+        else:
+            answer(q["id"],f"开始检测 {len(ids)} 个目标")
+            panel(chat,f"🔄 正在检测全部目标…\n\n进度：0/{len(ids)}",[[{"text":"请稍候…","callback_data":"noop"}]],mid)
+            POOL.submit(check_all_ui,ids,chat,mid)
+    elif data=="noop":
+        answer(q["id"],"检测正在进行，请稍候…")
     elif data=="events":
         with DB_LOCK, db() as c: rows=c.execute("SELECT e.*,t.name FROM events e LEFT JOIN targets t ON t.id=e.target_id ORDER BY e.id DESC LIMIT 10").fetchall()
         text="📝 最近事件\n\n"+("\n\n".join(f"{datetime.fromtimestamp(r['created_at']):%m-%d %H:%M} · {r['name'] or '已删除'} · {r['event_type']}" for r in rows) if rows else "暂无事件")
         panel(chat,text,[[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
     elif data=="help": panel(chat,"ℹ️ 使用说明\n\n/start 打开菜单\n/cancel 取消当前操作\n\nBot 检测 IPv4 TCP 端口。域名支持指定 DNS，并可选择故障后解析或持续监测 DNS。告警自动发送到创建目标的会话。",[[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
 
-def handle_edit_interval(uid,chat,text,user_mid=None):
+def handle_edit_interval(uid,chat,text):
     s=SESSIONS.get(uid)
     if not s or s["step"]!="edit_interval": return False
-    delete_message(chat,user_mid)
     if not text.isdigit() or not 10<=int(text)<=86400: panel(chat,"间隔必须为 10-86400 秒，请重新输入：",[[{"text":"❌ 取消","callback_data":f"view:{s['data']['id']}"}]]); return True
     tid=s["data"]["id"]
     with DB_LOCK, db() as c: c.execute("UPDATE targets SET interval_seconds=?,updated_at=? WHERE id=?",(int(text),int(time.time()),tid))
-    SESSIONS.pop(uid,None); r=get_target(tid); toggle="暂停" if r["enabled"] else "启用"
-    panel(chat,"✅ 检测间隔已修改。\n\n"+target_text(r),[[{"text":"🔄 立即检测","callback_data":f"check:{tid}"},{"text":toggle,"callback_data":f"toggle:{tid}"}],[{"text":"✏️ 修改间隔","callback_data":f"editint:{tid}"},{"text":"🗑 删除","callback_data":f"delask:{tid}"}],[{"text":"⬅️ 列表","callback_data":"list"}]]); return True
+    SESSIONS.pop(uid,None); r=get_target(tid)
+    panel(chat,"✅ 检测间隔已修改。\n\n"+target_text(r),detail_keyboard(r)); return True
 
 def run():
     if not TOKEN or not ADMINS: raise SystemExit("必须配置 TELEGRAM_BOT_TOKEN 和 TELEGRAM_ADMIN_IDS")
@@ -403,7 +446,7 @@ def run():
                 if "callback_query" in u: callback(u["callback_query"])
                 elif "message" in u:
                     m=u["message"]; uid=m.get("from",{}).get("id",0); text=m.get("text","").strip(); chat=m["chat"]["id"]
-                    if not handle_edit_interval(uid,chat,text,m.get("message_id")): handle_message(m)
+                    if not handle_edit_interval(uid,chat,text): handle_message(m)
             except Exception: log.exception("处理更新失败")
 
 if __name__=="__main__": run()
