@@ -15,6 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("ddnswatch")
 DB_LOCK = threading.RLock()
 SESSIONS = {}
+PANELS = {}
 RUNNING = set()
 POOL = ThreadPoolExecutor(max_workers=20)
 
@@ -76,6 +77,24 @@ def edit(chat, mid, text, keyboard=None):
     if keyboard: d["reply_markup"] = {"inline_keyboard": keyboard}
     return api("editMessageText", d)
 
+def delete_message(chat, mid):
+    if mid: api("deleteMessage", {"chat_id": chat, "message_id": mid})
+
+def panel(chat, text, keyboard=None, mid=None):
+    """交互界面始终复用一条 Bot 消息，无法编辑时才重建。"""
+    mid = mid or PANELS.get(chat)
+    if mid:
+        result = edit(chat, mid, text, keyboard)
+        if result:
+            PANELS[chat] = mid
+            return result
+    result = send(chat, text, keyboard)
+    if isinstance(result, dict) and result.get("message_id"):
+        old = PANELS.get(chat)
+        PANELS[chat] = result["message_id"]
+        if old and old != PANELS[chat]: delete_message(chat, old)
+    return result
+
 def answer(cid, text=""):
     api("answerCallbackQuery", {"callback_query_id": cid, "text": text})
 
@@ -85,7 +104,7 @@ def main_keyboard():
             [{"text":"📝 最近事件","callback_data":"events"},{"text":"ℹ️ 帮助","callback_data":"help"}]]
 
 def menu(chat, text="🖥️ DDNS Watch\n\n请选择操作：", mid=None):
-    return edit(chat, mid, text, main_keyboard()) if mid else send(chat, text, main_keyboard())
+    return panel(chat, text, main_keyboard(), mid)
 
 def valid_target(s):
     try: socket.inet_aton(s); return "ip"
@@ -102,14 +121,63 @@ def duration(n):
     if not parts or s: parts.append(f"{s}秒")
     return " ".join(parts)
 
-def resolve(host, server):
+def resolve_doh(host):
+    """传统 DNS 不可用时，通过 HTTPS 443 查询 Google DNS。"""
+    cmd = ["curl", "-sS", "--fail", "--max-time", "10", "-G",
+           "https://dns.google/resolve", "--data-urlencode", f"name={host}",
+           "--data-urlencode", "type=A"]
+    if PROXY: cmd[1:1] = ["--proxy", PROXY]
     try:
-        p=subprocess.run(["dig","+time=4","+tries=1",f"@{server}",host,"A","+short"], capture_output=True,text=True,timeout=7)
-        for x in p.stdout.splitlines():
-            try: socket.inet_aton(x.strip()); return x.strip(), ""
-            except OSError: pass
-        return "", "DNS 未返回 IPv4 A 记录"
-    except Exception as e: return "", f"DNS 解析失败：{e}"
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=13)
+        if p.returncode: return "", (p.stderr or "DoH 请求失败").strip()
+        result = json.loads(p.stdout)
+        for answer in result.get("Answer", []):
+            if answer.get("type") == 1:
+                ip = str(answer.get("data", "")).strip()
+                try:
+                    socket.inet_aton(ip)
+                    if ip.count(".") == 3: return ip, ""
+                except OSError: pass
+        return "", f"DoH 未返回 IPv4 A 记录（状态 {result.get('Status', '未知')}）"
+    except Exception as e: return "", f"DoH 解析失败：{e}"
+
+def resolve(host, server):
+    """优先查询指定 DNS；失败后自动回退到 DNS-over-HTTPS。"""
+    name = host.rstrip(".")
+    seen = set()
+    dns_error = ""
+    try:
+        for _ in range(6):
+            if name.lower() in seen:
+                dns_error = "DNS CNAME 循环"; break
+            seen.add(name.lower())
+            p = subprocess.run(
+                ["dig", "+time=4", "+tries=1", f"@{server}", name, "A", "+short"],
+                capture_output=True, text=True, timeout=7)
+            lines = [x.strip() for x in p.stdout.splitlines() if x.strip()]
+            for x in lines:
+                try:
+                    socket.inet_aton(x)
+                    if x.count(".") == 3: return x, ""
+                except OSError: pass
+            cname = next((x.rstrip(".") for x in lines
+                          if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.?", x)), "")
+            if cname and cname.lower() != name.lower():
+                name = cname; continue
+            detail = (p.stderr or "").strip()
+            dns_error = (f"DNS 查询失败（{server}）：{detail or 'dig 退出码 '+str(p.returncode)}"
+                         if p.returncode else f"DNS 未返回 IPv4 A 记录（{server}）")
+            break
+        else: dns_error = "DNS CNAME 层级超过限制"
+    except subprocess.TimeoutExpired:
+        dns_error = f"DNS 查询超时（{server}:53）"
+    except Exception as e:
+        dns_error = f"DNS 解析失败：{e}"
+    ip, doh_error = resolve_doh(host)
+    if ip:
+        log.warning("%s；已通过 DoH 成功解析 %s -> %s", dns_error, host, ip)
+        return ip, ""
+    return "", f"{dns_error}；DoH 回退失败：{doh_error}"
 
 def tcp_test(ip, port):
     try:
@@ -206,18 +274,19 @@ def target_text(r):
 
 def show_list(chat, mid=None):
     with DB_LOCK, db() as c: rows=c.execute("SELECT t.*,COALESCE(s.status,'INIT') status FROM targets t LEFT JOIN states s ON s.target_id=t.id ORDER BY t.id").fetchall()
-    if not rows: return edit(chat,mid,"📋 暂无监测目标。",[[{"text":"➕ 添加","callback_data":"add"}],[{"text":"🏠 主菜单","callback_data":"menu"}]])
+    if not rows: return panel(chat,"📋 暂无监测目标。",[[{"text":"➕ 添加","callback_data":"add"}],[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
     kb=[[{"text":f"{'🟢' if r['status']=='UP' else '🔴' if r['status']=='DOWN' else '⚪'} {r['name']}","callback_data":f"view:{r['id']}"}] for r in rows]
     kb.append([{"text":"🏠 主菜单","callback_data":"menu"}])
-    edit(chat,mid,f"📋 监测列表（{len(rows)}）\n点击目标查看详情：",kb)
+    panel(chat,f"📋 监测列表（{len(rows)}）\n点击目标查看详情：",kb,mid)
 
-def add_prompt(chat, step, text=None):
+def add_prompt(chat, step, text=None, mid=None):
     prompts={"name":"请输入监测名称，例如：日本家宽","target":"请输入域名或 IPv4，例如：jp.example.com","port":"请输入 TCP 端口（1-65535）","dns":"请输入 DNS 服务器 IPv4，发送 /default 使用 223.5.5.5","interval":"请输入检测间隔秒数（10-86400）"}
-    send(chat,text or prompts[step],[[{"text":"❌ 取消","callback_data":"cancel"}]])
+    panel(chat,text or prompts[step],[[{"text":"❌ 取消","callback_data":"cancel"}]],mid)
 
 def handle_message(m):
-    chat=m["chat"]["id"]; uid=m.get("from",{}).get("id",0); text=m.get("text","").strip()
+    chat=m["chat"]["id"]; uid=m.get("from",{}).get("id",0); text=m.get("text","").strip(); user_mid=m.get("message_id")
     if uid not in ADMINS: send(chat,f"⛔ 你没有权限使用此 Bot。\n你的 Telegram ID：{uid}"); return
+    delete_message(chat,user_mid)
     if text in ("/start","/menu","/cancel"): SESSIONS.pop(uid,None); menu(chat); return
     s=SESSIONS.get(uid)
     if not s: menu(chat,"无法识别命令，请使用菜单："); return
@@ -245,19 +314,22 @@ def handle_message(m):
 
 def ask_mode(chat,s):
     s["step"]="mode"
-    send(chat,"请选择 DDNS 监测方式：",[[{"text":"故障后重新解析","callback_data":"mode:failure"}],[{"text":"持续检测 DNS 变化","callback_data":"mode:continuous"}],[{"text":"❌ 取消","callback_data":"cancel"}]])
+    panel(chat,"请选择 DDNS 监测方式：",[[{"text":"故障后重新解析","callback_data":"mode:failure"}],[{"text":"持续检测 DNS 变化","callback_data":"mode:continuous"}],[{"text":"❌ 取消","callback_data":"cancel"}]])
 
 def ask_interval(chat,s): s["step"]="interval"; add_prompt(chat,"interval")
 
 def confirm_add(chat,uid):
     d=SESSIONS[uid]["data"]; mode="持续检测 DNS" if d.get("dns_mode")=="continuous" else "故障后解析"
     text=f"请确认监测配置：\n\n名称：{d['name']}\n目标：{d['target']}:{d['port']}\n类型：{'域名' if d['target_type']=='domain' else 'IPv4'}\nDNS：{d.get('dns_server') or '不适用'}\n间隔：{d['interval_seconds']}秒\n模式：{mode}"
-    send(chat,text,[[{"text":"✅ 确认添加","callback_data":"addconfirm"},{"text":"❌ 取消","callback_data":"cancel"}]])
+    panel(chat,text,[[{"text":"✅ 确认添加","callback_data":"addconfirm"},{"text":"❌ 取消","callback_data":"cancel"}]])
     SESSIONS[uid]["step"]="confirm"
 
 def callback(q):
-    uid=q["from"]["id"]; chat=q["message"]["chat"]["id"]; mid=q["message"]["message_id"]; data=q.get("data",""); answer(q["id"])
+    uid=q["from"]["id"]; chat=q["message"]["chat"]["id"]; mid=q["message"]["message_id"]; data=q.get("data",""); PANELS[chat]=mid; answer(q["id"])
     if uid not in ADMINS: send(chat,f"⛔ 无权限。你的 Telegram ID：{uid}"); return
+    # 离开添加/编辑流程时清除旧会话，避免删除后仍提示输入间隔。
+    if not (data in ("add", "addconfirm") or data.startswith("mode:") or data.startswith("editint:")):
+        SESSIONS.pop(uid, None)
     if data=="menu": SESSIONS.pop(uid,None); menu(chat,mid=mid)
     elif data=="add": SESSIONS[uid]={"step":"name","data":{}}; add_prompt(chat,"name")
     elif data=="cancel": SESSIONS.pop(uid,None); menu(chat,"操作已取消。")
@@ -271,48 +343,51 @@ def callback(q):
         with DB_LOCK, db() as c:
             cur=c.execute("INSERT INTO targets(name,target,target_type,port,dns_server,interval_seconds,dns_mode,notify_chat_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(d["name"],d["target"],d["target_type"],d["port"],d.get("dns_server",""),d["interval_seconds"],d.get("dns_mode","failure"),chat,now,now)); tid=cur.lastrowid
             c.execute("INSERT INTO states(target_id,next_check_at) VALUES(?,0)",(tid,))
-        SESSIONS.pop(uid,None); send(chat,"✅ 已添加，监测将在数秒内开始。",[[{"text":"查看详情","callback_data":f"view:{tid}"},{"text":"🏠 主菜单","callback_data":"menu"}]])
+        SESSIONS.pop(uid,None); panel(chat,"✅ 已添加，监测将在数秒内开始。",[[{"text":"查看详情","callback_data":f"view:{tid}"},{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
     elif data=="list": show_list(chat,mid)
     elif data.startswith("view:"):
         tid=int(data.split(":")[1]); r=get_target(tid)
-        if not r: send(chat,"目标不存在。"); return
+        if not r: panel(chat,"目标不存在。",main_keyboard(),mid); return
         toggle="暂停" if r["enabled"] else "启用"
-        edit(chat,mid,target_text(r),[[{"text":"🔄 立即检测","callback_data":f"check:{tid}"},{"text":toggle,"callback_data":f"toggle:{tid}"}],[{"text":"✏️ 修改间隔","callback_data":f"editint:{tid}"},{"text":"🗑 删除","callback_data":f"delask:{tid}"}],[{"text":"⬅️ 列表","callback_data":"list"}]])
+        panel(chat,target_text(r),[[{"text":"🔄 立即检测","callback_data":f"check:{tid}"},{"text":toggle,"callback_data":f"toggle:{tid}"}],[{"text":"✏️ 修改间隔","callback_data":f"editint:{tid}"},{"text":"🗑 删除","callback_data":f"delask:{tid}"}],[{"text":"⬅️ 列表","callback_data":"list"}]],mid)
     elif data.startswith("check:"):
-        tid=int(data.split(":")[1]); POOL.submit(check_target,tid,True); answer(q["id"],"已开始检测"); send(chat,"🔄 已触发检测，稍后刷新详情。")
+        tid=int(data.split(":")[1]); POOL.submit(check_target,tid,True); answer(q["id"],"已开始检测")
     elif data.startswith("toggle:"):
         tid=int(data.split(":")[1])
         with DB_LOCK, db() as c: c.execute("UPDATE targets SET enabled=1-enabled,updated_at=? WHERE id=?",(int(time.time()),tid)); c.execute("UPDATE states SET next_check_at=0 WHERE target_id=?",(tid,))
-        r=get_target(tid); send(chat,f"✅ 已{'启用' if r['enabled'] else '暂停'}：{r['name']}")
+        r=get_target(tid); toggle="暂停" if r["enabled"] else "启用"
+        panel(chat,target_text(r),[[{"text":"🔄 立即检测","callback_data":f"check:{tid}"},{"text":toggle,"callback_data":f"toggle:{tid}"}],[{"text":"✏️ 修改间隔","callback_data":f"editint:{tid}"},{"text":"🗑 删除","callback_data":f"delask:{tid}"}],[{"text":"⬅️ 列表","callback_data":"list"}]],mid)
     elif data.startswith("editint:"):
-        tid=int(data.split(":")[1]); SESSIONS[uid]={"step":"edit_interval","data":{"id":tid}}; send(chat,"请输入新的检测间隔秒数（10-86400）：")
+        tid=int(data.split(":")[1]); SESSIONS[uid]={"step":"edit_interval","data":{"id":tid}}; panel(chat,"请输入新的检测间隔秒数（10-86400）：",[[{"text":"❌ 取消","callback_data":f"view:{tid}"}]],mid)
     elif data.startswith("delask:"):
         tid=int(data.split(":")[1]); r=get_target(tid)
-        if r: edit(chat,mid,f"确认删除监测目标“{r['name']}”？此操作不可恢复。",[[{"text":"确认删除","callback_data":f"del:{tid}"},{"text":"取消","callback_data":f"view:{tid}"}]])
+        if r: panel(chat,f"确认删除监测目标“{r['name']}”？此操作不可恢复。",[[{"text":"确认删除","callback_data":f"del:{tid}"},{"text":"取消","callback_data":f"view:{tid}"}]],mid)
     elif data.startswith("del:"):
         tid=int(data.split(":")[1])
         with DB_LOCK, db() as c: c.execute("DELETE FROM targets WHERE id=?",(tid,))
-        send(chat,"✅ 已删除监测目标。",main_keyboard())
+        panel(chat,"✅ 已删除监测目标。",main_keyboard(),mid)
     elif data=="summary":
         with DB_LOCK, db() as c: rows=c.execute("SELECT COALESCE(s.status,'INIT') status,COUNT(*) n FROM targets t LEFT JOIN states s ON s.target_id=t.id GROUP BY status").fetchall()
-        z={r["status"]:r["n"] for r in rows}; edit(chat,mid,f"📊 状态总览\n\n🟢 正常：{z.get('UP',0)}\n🔴 故障：{z.get('DOWN',0)}\n⚪ 待检测：{z.get('INIT',0)}",[[{"text":"🏠 主菜单","callback_data":"menu"}]])
+        z={r["status"]:r["n"] for r in rows}; panel(chat,f"📊 状态总览\n\n🟢 正常：{z.get('UP',0)}\n🔴 故障：{z.get('DOWN',0)}\n⚪ 待检测：{z.get('INIT',0)}",[[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
     elif data=="checkall":
         with DB_LOCK, db() as c: ids=[r[0] for r in c.execute("SELECT id FROM targets WHERE enabled=1")]
         for tid in ids: POOL.submit(check_target,tid,True)
-        send(chat,f"🔄 已触发 {len(ids)} 个目标检测。")
+        answer(q["id"],f"已触发 {len(ids)} 个目标检测")
     elif data=="events":
         with DB_LOCK, db() as c: rows=c.execute("SELECT e.*,t.name FROM events e LEFT JOIN targets t ON t.id=e.target_id ORDER BY e.id DESC LIMIT 10").fetchall()
         text="📝 最近事件\n\n"+("\n\n".join(f"{datetime.fromtimestamp(r['created_at']):%m-%d %H:%M} · {r['name'] or '已删除'} · {r['event_type']}" for r in rows) if rows else "暂无事件")
-        edit(chat,mid,text,[[{"text":"🏠 主菜单","callback_data":"menu"}]])
-    elif data=="help": edit(chat,mid,"ℹ️ 使用说明\n\n/start 打开菜单\n/cancel 取消当前操作\n\nBot 检测 IPv4 TCP 端口。域名支持指定 DNS，并可选择故障后解析或持续监测 DNS。告警自动发送到创建目标的会话。",[[{"text":"🏠 主菜单","callback_data":"menu"}]])
+        panel(chat,text,[[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
+    elif data=="help": panel(chat,"ℹ️ 使用说明\n\n/start 打开菜单\n/cancel 取消当前操作\n\nBot 检测 IPv4 TCP 端口。域名支持指定 DNS，并可选择故障后解析或持续监测 DNS。告警自动发送到创建目标的会话。",[[{"text":"🏠 主菜单","callback_data":"menu"}]],mid)
 
-def handle_edit_interval(uid,chat,text):
+def handle_edit_interval(uid,chat,text,user_mid=None):
     s=SESSIONS.get(uid)
     if not s or s["step"]!="edit_interval": return False
-    if not text.isdigit() or not 10<=int(text)<=86400: send(chat,"间隔必须为 10-86400 秒，请重新输入："); return True
+    delete_message(chat,user_mid)
+    if not text.isdigit() or not 10<=int(text)<=86400: panel(chat,"间隔必须为 10-86400 秒，请重新输入：",[[{"text":"❌ 取消","callback_data":f"view:{s['data']['id']}"}]]); return True
     tid=s["data"]["id"]
     with DB_LOCK, db() as c: c.execute("UPDATE targets SET interval_seconds=?,updated_at=? WHERE id=?",(int(text),int(time.time()),tid))
-    SESSIONS.pop(uid,None); send(chat,"✅ 检测间隔已修改。",[[{"text":"查看详情","callback_data":f"view:{tid}"}]]); return True
+    SESSIONS.pop(uid,None); r=get_target(tid); toggle="暂停" if r["enabled"] else "启用"
+    panel(chat,"✅ 检测间隔已修改。\n\n"+target_text(r),[[{"text":"🔄 立即检测","callback_data":f"check:{tid}"},{"text":toggle,"callback_data":f"toggle:{tid}"}],[{"text":"✏️ 修改间隔","callback_data":f"editint:{tid}"},{"text":"🗑 删除","callback_data":f"delask:{tid}"}],[{"text":"⬅️ 列表","callback_data":"list"}]]); return True
 
 def run():
     if not TOKEN or not ADMINS: raise SystemExit("必须配置 TELEGRAM_BOT_TOKEN 和 TELEGRAM_ADMIN_IDS")
@@ -328,7 +403,7 @@ def run():
                 if "callback_query" in u: callback(u["callback_query"])
                 elif "message" in u:
                     m=u["message"]; uid=m.get("from",{}).get("id",0); text=m.get("text","").strip(); chat=m["chat"]["id"]
-                    if not handle_edit_interval(uid,chat,text): handle_message(m)
+                    if not handle_edit_interval(uid,chat,text,m.get("message_id")): handle_message(m)
             except Exception: log.exception("处理更新失败")
 
 if __name__=="__main__": run()
